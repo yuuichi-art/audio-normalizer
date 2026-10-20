@@ -1,0 +1,31 @@
+# Artefactos de compilación y distribución
+dist/
+build/
+*.spec.bak
+*.zip
+
+# Caché de Python y entornos virtuales
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+# Archivos de audio locales de prueba y salidas
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.m4a
+*.sm
+*.ssc
+
+# Archivos temporales de IDE / Sistema Operativo
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
