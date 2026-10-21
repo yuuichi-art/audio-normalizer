@@ -1,4 +1,4 @@
-"""Análisis rítmico y generación de curva continua de tempo a nivel de compás (44,100 Hz)."""
+"""Análisis rítmico con filtro de inercia temporal (±8%) y proyección de cierre a 44,100 Hz."""
 
 from dataclasses import dataclass
 from typing import List, Optional
@@ -6,6 +6,7 @@ import numpy as np
 import librosa
 
 TARGET_SR = 44100
+DEVIATION_TOLERANCE = 0.08  # ±8% de tolerancia respecto a T_bar
 
 
 @dataclass
@@ -16,6 +17,7 @@ class BarSegment:
     end_sample: int
     target_start_sample: int
     target_end_sample: int
+    is_synthetic: bool = False
 
     @property
     def start_time_sec(self) -> float:
@@ -50,14 +52,17 @@ class BarSegment:
 
 @dataclass
 class BarGrid:
-    """Contiene la rejilla global sample-exacta y los parámetros para la curva continua."""
+    """Contiene la rejilla global sample-exacta y las estadísticas del filtro de inercia."""
     sr: int
     beats_per_bar: int
     native_bpm: float
     target_bpm: float
     t0_sample: int
     t0_sec: float
+    t_bar_sec: float
     delta_t_sec: float
+    outliers_replaced: int
+    projected_tail_bars: int
     bar_boundaries_samples: np.ndarray
     bar_boundaries_sec: np.ndarray
     segments: List[BarSegment]
@@ -71,18 +76,26 @@ def detect_bar_grid(
     start_bpm: float = 120.0,
     tightness: float = 800.0,
     onset_fmax: float = 4000.0,
+    deviation_tolerance: float = DEVIATION_TOLERANCE,
 ) -> BarGrid:
     """
-    Usa librosa únicamente para el análisis de ritmo a 44,100 Hz y construye la
-    rejilla matemática de compases desde el primer pulso real (t0):
-
-        delta_t = (60.0 / BPM_objetivo) * beats_per_bar
-        target_sample(k) = round((t0 + k * delta_t) * sr)
+    Detecta la grilla de compases a 44,100 Hz aplicando:
+    1. Duración de referencia nominal:
+         T_bar = (60.0 / BPM_nominal) * beats_per_bar
+    2. Filtro de inercia temporal y rechazo de anomalías (±8%):
+         Verifica 0.92 * T_bar <= Δt_k <= 1.08 * T_bar.
+         Si Δt_k cae fuera del rango, descarta t_{k+1} y lo establece sintéticamente
+         usando la mediana de los compases válidos previos o T_bar.
+    3. Fade-out final / Cierre:
+         Si en la sección final la confianza de onsets cae o termina la detección antes
+         del final del audio, continúa proyectando pasos constantes de T_bar hasta cubrir la pista.
     """
     if sr != TARGET_SR:
         raise ValueError(f"El análisis requiere estrictamente sr={TARGET_SR} Hz (recibido: {sr} Hz).")
 
     y_mono = librosa.to_mono(y) if y.ndim > 1 else y
+    total_samples = len(y_mono)
+    total_duration_sec = total_samples / float(sr)
     hop_length = 512
 
     onset_env = librosa.onset.onset_strength(
@@ -108,15 +121,76 @@ def detect_bar_grid(
             f"para agrupar en compases de {beats_per_bar} tiempos."
         )
 
-    bar_boundaries_samples = beat_samples[::beats_per_bar].astype(int)
+    raw_bar_samples = beat_samples[::beats_per_bar].astype(int)
+    raw_bar_sec = raw_bar_samples / float(sr)
+
+    # 1. Cálculo de BPM nominal y duración base de referencia T_bar
+    raw_durations = np.diff(raw_bar_sec)
+    median_bar_sec = float(np.median(raw_durations))
+    native_bpm = (60.0 * beats_per_bar) / median_bar_sec
+    t_bar_sec = (60.0 / native_bpm) * beats_per_bar
+
+    # Evaluar confianza de onsets en el cierre (fade-out) para descartar cola sin señal rítmica
+    frame_times = librosa.frames_to_time(np.arange(len(onset_env)), sr=sr, hop_length=hop_length)
+    global_onset_ref = float(np.percentile(onset_env, 75)) if len(onset_env) > 0 else 1.0
+    confidence_threshold = 0.12 * global_onset_ref
+
+    confident_end_idx = len(raw_bar_sec)
+    while confident_end_idx > 2:
+        t_prev = raw_bar_sec[confident_end_idx - 2]
+        t_last = raw_bar_sec[confident_end_idx - 1]
+        mask = (frame_times >= t_prev) & (frame_times < t_last)
+        bar_peak_onset = float(np.max(onset_env[mask])) if np.any(mask) else 0.0
+        if bar_peak_onset < confidence_threshold:
+            confident_end_idx -= 1
+        else:
+            break
+
+    bar_sec_list = list(raw_bar_sec[:confident_end_idx].astype(np.float64))
+    synthetic_flags: List[bool] = [False] * (len(bar_sec_list) - 1)
+
+    # 2. Filtro de rechazo por desviación (±8% de T_bar) con inercia temporal
+    min_dt = (1.0 - deviation_tolerance) * t_bar_sec
+    max_dt = (1.0 + deviation_tolerance) * t_bar_sec
+    valid_durations: List[float] = []
+    outliers_replaced = 0
+
+    for k in range(len(bar_sec_list) - 1):
+        dt_k = bar_sec_list[k + 1] - bar_sec_list[k]
+        if min_dt <= dt_k <= max_dt:
+            valid_durations.append(dt_k)
+        else:
+            ref_step = float(np.median(valid_durations)) if valid_durations else t_bar_sec
+            bar_sec_list[k + 1] = bar_sec_list[k] + ref_step
+            synthetic_flags[k] = True
+            outliers_replaced += 1
+
+    # Recalcular BPM nominal refinado sobre los intervalos válidos filtrados
+    if valid_durations:
+        t_bar_sec = float(np.median(valid_durations))
+        native_bpm = (60.0 * beats_per_bar) / t_bar_sec
+
+    # 3. Fade-out final / Cierre: proyectar pasos constantes de T_bar hasta el final del audio
+    projected_tail_bars = 0
+    while bar_sec_list[-1] + t_bar_sec <= total_duration_sec:
+        next_t = bar_sec_list[-1] + t_bar_sec
+        bar_sec_list.append(next_t)
+        synthetic_flags.append(True)
+        projected_tail_bars += 1
+
+    # Recortar cualquier frontera que haya excedido ligeramente total_duration_sec por sustitución
+    while len(bar_sec_list) > 2 and bar_sec_list[-1] > total_duration_sec:
+        bar_sec_list.pop()
+        synthetic_flags.pop()
+
+    bar_boundaries_sec = np.array(bar_sec_list, dtype=np.float64)
+    bar_boundaries_samples = np.clip(
+        np.round(bar_boundaries_sec * sr).astype(int), 0, total_samples - 1
+    )
     bar_boundaries_sec = bar_boundaries_samples / float(sr)
 
     t0_sample = int(bar_boundaries_samples[0])
     t0_sec = float(bar_boundaries_sec[0])
-
-    bar_durations_sec = np.diff(bar_boundaries_sec)
-    median_bar_sec = float(np.median(bar_durations_sec))
-    native_bpm = (60.0 * beats_per_bar) / median_bar_sec
 
     if target_bpm is None:
         target_bpm = native_bpm
@@ -137,6 +211,7 @@ def detect_bar_grid(
                 end_sample=int(bar_boundaries_samples[k + 1]),
                 target_start_sample=int(target_bar_samples[k]),
                 target_end_sample=int(target_bar_samples[k + 1]),
+                is_synthetic=synthetic_flags[k],
             )
         )
 
@@ -147,7 +222,10 @@ def detect_bar_grid(
         target_bpm=float(target_bpm),
         t0_sample=t0_sample,
         t0_sec=t0_sec,
+        t_bar_sec=float(t_bar_sec),
         delta_t_sec=delta_t_sec,
+        outliers_replaced=outliers_replaced,
+        projected_tail_bars=projected_tail_bars,
         bar_boundaries_samples=bar_boundaries_samples,
         bar_boundaries_sec=bar_boundaries_sec,
         segments=segments,

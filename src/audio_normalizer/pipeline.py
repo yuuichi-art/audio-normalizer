@@ -81,7 +81,8 @@ def normalize_song_tempo(
 ) -> dict:
     """
     1. Configura y localiza el binario `ffmpeg.exe` portable (o del sistema).
-    2. Analiza los pulsos y compases a 44,100 Hz usando librosa.
+    2. Analiza los pulsos y compases a 44,100 Hz aplicando el filtro de inercia temporal (±8%)
+       y proyección de cierre constante (T_bar).
     3. Construye la curva continua y suave de tempo con integral exacta por compás:
            delta_t = (60 / BPM_objetivo) * beats_per_bar
     4. Delega el renderizado acústico exclusivamente al filtro nativo `rubberband` de FFmpeg
@@ -99,8 +100,10 @@ def normalize_song_tempo(
     _notify("1/3  Cargando y remuestreando audio de análisis a 44,100 Hz...")
     y_analysis, sr = librosa.load(str(resolved_input), sr=TARGET_SR, mono=True)
 
-    # 2. Calcular la rejilla de compases desde t0
-    _notify(f"2/3  Detectando rejilla de compases ({beats_per_bar} pulsos/compás) con librosa...")
+    # 2. Calcular la rejilla de compases desde t0 con filtro de inercia (±8%) y proyección final
+    _notify(
+        f"2/3  Detectando rejilla de compases ({beats_per_bar} pulsos/compás) y filtrando anomalías (±8%)..."
+    )
     grid = detect_bar_grid(
         y=y_analysis,
         sr=sr,
@@ -111,7 +114,7 @@ def normalize_song_tempo(
     # 3. Renderizar directamente desde el archivo original con FFmpeg + librubberband
     _notify(
         f"3/3  Renderizando con FFmpeg rubberband a {grid.target_bpm:.2f} BPM "
-        f"({len(grid.segments)} compases)..."
+        f"({len(grid.segments)} compases, {grid.outliers_replaced} anomalías corregidas)..."
     )
     render_with_ffmpeg_rubberband(
         input_path=resolved_input,
@@ -134,11 +137,14 @@ def normalize_song_tempo(
         "output_format": "MP3 320 kbps 44100 Hz Stereo (libmp3lame)" if is_mp3 else "WAV PCM_24 44100 Hz Stereo",
         "sample_rate": TARGET_SR,
         "t0_sec": round(grid.t0_sec, 6),
+        "t_bar_sec": round(grid.t_bar_sec, 6),
         "bar_interval_sec": round(grid.delta_t_sec, 6),
         "native_bpm": round(grid.native_bpm, 2),
         "target_bpm": round(grid.target_bpm, 2),
         "total_bars": len(grid.segments),
         "bars_adjusted": adjusted_bars,
+        "outliers_replaced": grid.outliers_replaced,
+        "projected_tail_bars": grid.projected_tail_bars,
         "min_stretch_rate": round(float(np.min(rates)), 4),
         "max_stretch_rate": round(float(np.max(rates)), 4),
     }

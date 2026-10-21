@@ -141,10 +141,13 @@ def process_audio_ui(
     )
 
     bpm_card = f"{stats['target_bpm']} BPM (Nativo: {stats['native_bpm']} BPM)"
-    bars_card = f"{stats['bars_adjusted']} ajustados de {stats['total_bars']} compases ({time_signature})"
+    bars_card = (
+        f"{stats['bars_adjusted']} ajustados / {stats['total_bars']} compases ({time_signature}) "
+        f"· {stats['outliers_replaced']} anomalías filtradas"
+    )
     stretch_card = (
         f"{stats['min_stretch_rate']:.4f}x – {stats['max_stretch_rate']:.4f}x  "
-        f"(t0 = {stats['t0_sec']}s, Δt = {stats['bar_interval_sec']}s)"
+        f"(t0 = {stats['t0_sec']}s, T_bar = {stats['t_bar_sec']}s)"
     )
     details_card = (
         f"Archivo exportado: {stats['output']}\n"
